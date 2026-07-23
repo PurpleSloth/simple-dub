@@ -129,7 +129,7 @@ if ($InstallSilero) {
     Get-VerifiedFile `
         -Url "https://github.com/PurpleSloth/simple-dub/releases/download/v0.1.0/silero-worker.exe" `
         -Destination (Join-Path $WorkerDir "silero-worker.exe") `
-        -Sha256 "c68dc9cb4bedc34f1a74c4a9bf0254ccec30812244aa5418242f0fd815172360"
+        -Sha256 "1bd8ba6964c5fd05c5cc8014b8d407be5a9024f4f200409202c2db3fa990b576"
     Write-ProgressEvent 82 "Downloading Silero 5.5 model"
     Get-VerifiedFile `
         -Url "https://models.silero.ai/models/tts/ru/v5_5_ru.pt" `

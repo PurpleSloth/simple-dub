@@ -129,6 +129,16 @@ npm run build
 npm run desktop:build
 ```
 
+Воспроизводимая сборка автономного Silero-worker из нового Python-исходника:
+
+```powershell
+pwsh -NoProfile -File scripts/build-silero-worker.ps1
+```
+
+Скрипт использует CPython 3.12, создаёт отдельную среду в игнорируемом
+`output/`, устанавливает закреплённые CPU PyTorch, NumPy и PyInstaller и
+печатает SHA-256 готового `silero-worker.exe`.
+
 Проверка файлов будущего коммита на ключи OpenRouter:
 
 ```powershell
@@ -144,12 +154,14 @@ src-tauri/            Tauri desktop-приложение
 scripts/              Установка локального runtime
 runtime/              Бинарники и модели, игнорируется Git
 native/                Нативный worker Piper
+workers/               Новый исходник и зависимости Silero-worker
 _legacy_python/        Локальный Python-код вне Git
 ```
 
-В коммит и установщик не включаются файлы `.py`. Скомпилированный
-Silero-worker публикуется отдельным runtime-ресурсом и скачивается только
-при выборе Eugene.
+Старый Python-проект хранится локально в `_legacy_python/` и не попадает в
+Git. Новый минимальный Silero-worker и его закреплённые build-зависимости
+лежат в `workers/`, поэтому release-бинарник можно восстановить из репозитория.
+Скомпилированный worker скачивается приложением только при выборе Eugene.
 
 ## Лицензии моделей
 
