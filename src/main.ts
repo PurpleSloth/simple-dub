@@ -33,7 +33,7 @@ interface OpenRouterKeyStatus {
 interface TtsEngineStatus {
   id: TtsEngineId;
   display_name: string;
-  backend: "sherpa-onnx" | "silero-python";
+  backend: "sherpa-onnx" | "silero-standalone";
   model_id: string;
   speaker: string;
   sample_rate: number;
@@ -589,7 +589,7 @@ function renderTtsChoices(): void {
       const backend =
         status.backend === "sherpa-onnx"
           ? "Нативный ONNX"
-          : "Python/PyTorch под управлением приложения";
+          : "Автономный CPU-worker";
       const readiness = status.installed
         ? "Компонент установлен"
         : "Компонент потребуется установить";
@@ -701,7 +701,7 @@ function fallbackTtsStatuses(): TtsEngineStatus[] {
     {
       id: "silero-v5-5-eugene",
       display_name: "Silero 5.5 · Eugene",
-      backend: "silero-python",
+      backend: "silero-standalone",
       model_id: "v5_5_ru",
       speaker: "eugene",
       sample_rate: 48_000,

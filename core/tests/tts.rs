@@ -30,7 +30,7 @@ fn engines_expose_expected_backend_model_and_voice() {
     assert_eq!(piper.sample_rate, 22_050);
 
     let silero = TtsEngine::SileroEugene.descriptor();
-    assert_eq!(silero.backend, TtsBackend::SileroPython);
+    assert_eq!(silero.backend, TtsBackend::SileroStandalone);
     assert_eq!(silero.model_id, "v5_5_ru");
     assert_eq!(silero.speaker, "eugene");
     assert_eq!(silero.sample_rate, 48_000);
@@ -65,12 +65,10 @@ fn resolves_engine_specific_runtime_without_cross_engine_fallback() {
         .expect("готовый Silero runtime должен разрешаться");
     match resolved {
         simple_dub_core::tts::TtsRuntime::Silero(SileroRuntime {
-            python_path,
             worker_path,
             model_path,
         }) => {
-            assert!(python_path.ends_with("python.exe"));
-            assert!(worker_path.ends_with("silero_worker.py"));
+            assert!(worker_path.ends_with("silero-worker.exe"));
             assert!(model_path.ends_with("v5_5_ru.pt"));
         }
         other => panic!("ожидался Silero runtime, получен {other:?}"),
@@ -106,7 +104,6 @@ fn create_piper_runtime(root: &Path) {
 
 fn create_silero_runtime(root: &Path) {
     let runtime = SileroRuntime::expected(root);
-    touch(&runtime.python_path);
     touch(&runtime.worker_path);
     touch(&runtime.model_path);
 }

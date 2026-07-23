@@ -8,6 +8,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$RuntimeRoot = [System.IO.Path]::GetFullPath($RuntimeRoot)
 $BinDir = Join-Path $RuntimeRoot "bin"
 $ModelDir = Join-Path $RuntimeRoot "models"
 $DownloadDir = Join-Path $RuntimeRoot "downloads"
@@ -119,35 +120,20 @@ if ($InstallWhisper) {
 }
 
 if ($InstallSilero) {
-    Write-ProgressEvent 62 "Installing private Python runtime for Silero"
+    Write-ProgressEvent 62 "Downloading standalone Silero worker"
     $SileroRoot = Join-Path $RuntimeRoot "tts\silero-v5-5-eugene"
-    $PythonDir = Join-Path $SileroRoot "python"
-    $WorkerDir = Join-Path $SileroRoot "worker"
+    $WorkerDir = Join-Path $SileroRoot "bin"
     $SileroModels = Join-Path $SileroRoot "models"
     New-Item -ItemType Directory -Force -Path $SileroRoot, $WorkerDir, $SileroModels | Out-Null
 
-    if (-not (Test-Path -LiteralPath (Join-Path $PythonDir "python.exe"))) {
-        $PythonInstaller = Join-Path $DownloadDir "python-3.12.10-amd64.exe"
-        Get-VerifiedFile `
-            -Url "https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe" `
-            -Destination $PythonInstaller
-        $Arguments = "/quiet InstallAllUsers=0 Include_launcher=0 Include_test=0 Include_doc=0 Include_tcltk=0 Include_pip=1 Include_dev=0 PrependPath=0 TargetDir=`"$PythonDir`""
-        $Process = Start-Process -FilePath $PythonInstaller -ArgumentList $Arguments -Wait -PassThru
-        if ($Process.ExitCode -ne 0) { throw "Python installer failed with code $($Process.ExitCode)" }
-    }
-
-    Write-ProgressEvent 74 "Installing CPU PyTorch"
-    & (Join-Path $PythonDir "python.exe") -m pip install --disable-pip-version-check `
-        "torch==2.7.1" --index-url "https://download.pytorch.org/whl/cpu"
-    if ($LASTEXITCODE -ne 0) { throw "Failed to install PyTorch for Silero" }
-
-    Write-ProgressEvent 88 "Downloading Silero 5.5 and its worker"
+    Get-VerifiedFile `
+        -Url "https://github.com/PurpleSloth/simple-dub/releases/download/v0.1.0/silero-worker.exe" `
+        -Destination (Join-Path $WorkerDir "silero-worker.exe") `
+        -Sha256 "c68dc9cb4bedc34f1a74c4a9bf0254ccec30812244aa5418242f0fd815172360"
+    Write-ProgressEvent 82 "Downloading Silero 5.5 model"
     Get-VerifiedFile `
         -Url "https://models.silero.ai/models/tts/ru/v5_5_ru.pt" `
         -Destination (Join-Path $SileroModels "v5_5_ru.pt")
-    Get-VerifiedFile `
-        -Url "https://github.com/PurpleSloth/simple-dub/releases/download/v0.1.0/silero-worker.py" `
-        -Destination (Join-Path $WorkerDir "silero_worker.py")
 }
 
 Write-ProgressEvent 100 "Runtime components are ready"

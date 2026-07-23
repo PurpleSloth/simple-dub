@@ -453,33 +453,28 @@ fn synthesize_silero(
     work_dir: &Path,
 ) -> Result<Vec<PathBuf>, String> {
     let expected = SileroRuntime::expected(runtime_root);
-    let (python, worker, model) = if expected.python_path.is_file()
-        && expected.worker_path.is_file()
-        && expected.model_path.is_file()
-    {
-        (
-            expected.python_path,
-            expected.worker_path,
-            expected.model_path,
-        )
+    let (mut command, model) = if expected.worker_path.is_file() && expected.model_path.is_file() {
+        (Command::new(expected.worker_path), expected.model_path)
     } else {
         let project = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("src-tauri находится в корне проекта");
-        (
-            project.join("env").join("Scripts").join("python.exe"),
-            project
-                .join("_legacy_python")
-                .join("workers")
-                .join("silero_worker.py"),
-            runtime_root.join("models").join("v5_5_ru.pt"),
-        )
+        let python = project.join("env").join("Scripts").join("python.exe");
+        let worker = project
+            .join("_legacy_python")
+            .join("workers")
+            .join("silero_worker.py");
+        let model = runtime_root.join("models").join("v5_5_ru.pt");
+        if !python.is_file() || !worker.is_file() || !model.is_file() {
+            return Err(
+                "Silero runtime не установлен. Повторите установку компонента в приложении."
+                    .to_owned(),
+            );
+        }
+        let mut command = Command::new(python);
+        command.arg(worker);
+        (command, model)
     };
-    if !python.is_file() || !worker.is_file() || !model.is_file() {
-        return Err(
-            "Silero runtime не установлен. Повторите установку компонента в приложении.".to_owned(),
-        );
-    }
 
     let input_path = work_dir.join("silero-input.json");
     let output_dir = work_dir.join("tts");
@@ -498,8 +493,7 @@ fn synthesize_silero(
     .map_err(|error| format!("Не удалось сохранить Silero manifest: {error}"))?;
 
     let output = run_checked(
-        Command::new(python)
-            .arg(worker)
+        command
             .args(["--model"])
             .arg(model)
             .args(["--input"])

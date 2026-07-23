@@ -13,7 +13,7 @@ pub enum TtsEngine {
     #[default]
     #[serde(rename = "piper-dmitri-fp32")]
     PiperDmitriFp32,
-    /// Silero 5.5 в изолированном Python/PyTorch runtime.
+    /// Silero 5.5 в автономном CPU-worker.
     #[serde(rename = "silero-v5-5-eugene")]
     SileroEugene,
 }
@@ -50,7 +50,7 @@ impl TtsEngine {
             },
             Self::SileroEugene => TtsEngineDescriptor {
                 engine: self,
-                backend: TtsBackend::SileroPython,
+                backend: TtsBackend::SileroStandalone,
                 model_id: "v5_5_ru",
                 speaker: "eugene",
                 sample_rate: 48_000,
@@ -70,7 +70,7 @@ impl fmt::Display for TtsEngine {
 #[serde(rename_all = "kebab-case")]
 pub enum TtsBackend {
     SherpaOnnx,
-    SileroPython,
+    SileroStandalone,
 }
 
 /// Метаданные TTS-варианта, не зависящие от локальных путей.
@@ -117,7 +117,6 @@ impl PiperRuntime {
 /// Файлы изолированного Silero runtime.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SileroRuntime {
-    pub python_path: PathBuf,
     pub worker_path: PathBuf,
     pub model_path: PathBuf,
 }
@@ -127,18 +126,13 @@ impl SileroRuntime {
     pub fn expected(root: &Path) -> Self {
         let engine_root = root.join("tts").join(TtsEngine::SileroEugene.id());
         Self {
-            python_path: engine_root.join("python").join("python.exe"),
-            worker_path: engine_root.join("worker").join("silero_worker.py"),
+            worker_path: engine_root.join("bin").join("silero-worker.exe"),
             model_path: engine_root.join("models").join("v5_5_ru.pt"),
         }
     }
 
     fn missing_files(&self) -> Vec<PathBuf> {
-        required_files([
-            (&self.python_path, false),
-            (&self.worker_path, false),
-            (&self.model_path, false),
-        ])
+        required_files([(&self.worker_path, false), (&self.model_path, false)])
     }
 }
 
