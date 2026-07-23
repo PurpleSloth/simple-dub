@@ -32,6 +32,10 @@ node_modules/
 dist/
 .playwright-cli/
 
+# Генерируются из закреплённых npm-пакетов перед Tauri-сборкой
+src-tauri/bin/ffmpeg-*-pc-windows-msvc.exe
+src-tauri/bin/ffprobe-*-pc-windows-msvc.exe
+
 # IDE и ОС
 .idea/
 .vscode/

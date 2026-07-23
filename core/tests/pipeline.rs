@@ -2,8 +2,8 @@ use std::path::Path;
 
 use simple_dub_core::cache::{JobFingerprintInput, job_fingerprint};
 use simple_dub_core::commands::{
-    MixOptions, MuxOptions, SileroOptions, WhisperOptions, build_mix_filter,
-    build_mux_args, build_silero_args, build_whisper_args,
+    MixOptions, MuxOptions, SileroOptions, WhisperOptions, build_mix_filter, build_mux_args,
+    build_silero_args, build_whisper_args,
 };
 use simple_dub_core::media::{SubtitleKind, parse_ffprobe_json};
 use simple_dub_core::pipeline::{
@@ -94,7 +94,10 @@ fn builds_whisper_cpp_command_for_multilingual_cuda_flow() {
         vad_model_path: Some(Path::new("models/ggml-silero-v6.2.0.bin")),
     });
 
-    assert!(args.windows(2).any(|pair| pair == ["--model", "models/ggml-large-v3-turbo.bin"]));
+    assert!(
+        args.windows(2)
+            .any(|pair| pair == ["--model", "models/ggml-large-v3-turbo.bin"])
+    );
     assert!(args.windows(2).any(|pair| pair == ["--language", "auto"]));
     assert!(args.iter().any(|arg| arg == "--output-json"));
     assert!(args.iter().any(|arg| arg == "--vad"));
@@ -111,9 +114,15 @@ fn builds_silero_v5_5_worker_contract_without_qwen() {
         sample_rate: 48_000,
     });
 
-    assert!(args.windows(2).any(|pair| pair == ["--model", "models/v5_5_ru.pt"]));
+    assert!(
+        args.windows(2)
+            .any(|pair| pair == ["--model", "models/v5_5_ru.pt"])
+    );
     assert!(args.windows(2).any(|pair| pair == ["--speaker", "aidar"]));
-    assert!(args.windows(2).any(|pair| pair == ["--sample-rate", "48000"]));
+    assert!(
+        args.windows(2)
+            .any(|pair| pair == ["--sample-rate", "48000"])
+    );
     assert!(!args.iter().any(|arg| arg.to_lowercase().contains("qwen")));
 }
 
@@ -181,6 +190,7 @@ fn cache_key_changes_with_semantic_job_inputs() {
         audio_stream_index: 1,
         subtitle_stream_index: Some(2),
         translation_model: "google/gemini-3.5-flash-lite",
+        tts_engine: "piper-dmitri-fp32",
         tts_model: "v5_5_ru",
         tts_speaker: "aidar",
         original_volume_milli: 300,
@@ -188,7 +198,7 @@ fn cache_key_changes_with_semantic_job_inputs() {
 
     let first = job_fingerprint(&base);
     let mut changed = base.clone();
-    changed.audio_stream_index = 4;
+    changed.tts_engine = "silero-v5-5-eugene";
     let second = job_fingerprint(&changed);
 
     assert_ne!(first, second);

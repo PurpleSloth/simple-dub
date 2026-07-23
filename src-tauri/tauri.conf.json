@@ -6,7 +6,7 @@
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "npm run build",
+    "beforeBuildCommand": "npm run bundle:prepare && npm run build",
     "frontendDist": "../dist"
   },
   "app": {
@@ -26,6 +26,17 @@
     }
   },
   "bundle": {
-    "active": false
+    "active": true,
+    "targets": ["nsis"],
+    "externalBin": [
+      "bin/ffmpeg",
+      "bin/ffprobe",
+      "bin/piper-worker"
+    ],
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser"
+      }
+    }
   }
 }

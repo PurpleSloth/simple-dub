@@ -55,16 +55,23 @@ impl OpenRouterCredentialStore {
         }
     }
 
+    /// Получить ключ только для внутреннего API-запроса.
+    ///
+    /// Значение не сериализуется и не передаётся интерфейсу.
+    pub fn read(&self) -> Result<String, String> {
+        self.entry
+            .get_password()
+            .map_err(|error| credential_error("Не удалось прочитать сохранённый ключ", error))
+            .and_then(|key| validate_openrouter_key(&key))
+    }
+
     /// Удалить ключ. Отсутствующая запись считается успешным результатом.
     pub fn delete(&self) -> Result<OpenRouterKeyStatus, String> {
         match self.entry.delete_credential() {
-            Ok(()) | Err(KeyringError::NoEntry) => {
-                Ok(OpenRouterKeyStatus { configured: false })
-            }
+            Ok(()) | Err(KeyringError::NoEntry) => Ok(OpenRouterKeyStatus { configured: false }),
             Err(error) => Err(credential_error("Не удалось удалить ключ", error)),
         }
     }
-
 }
 
 /// Проверить формат и удалить случайные пробелы по краям.

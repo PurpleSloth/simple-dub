@@ -12,6 +12,7 @@ pub struct JobFingerprintInput<'a> {
     pub audio_stream_index: u32,
     pub subtitle_stream_index: Option<u32>,
     pub translation_model: &'a str,
+    pub tts_engine: &'a str,
     pub tts_model: &'a str,
     pub tts_speaker: &'a str,
     pub original_volume_milli: u16,

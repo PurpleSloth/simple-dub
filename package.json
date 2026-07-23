@@ -6,12 +6,16 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "bundle:prepare": "node scripts/prepare-bundle.mjs",
+    "desktop:build": "npm run bundle:prepare && tauri build",
     "check:secrets": "pwsh -NoProfile -File scripts/check-secrets.ps1",
     "tauri": "tauri"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",
-    "@tauri-apps/plugin-dialog": "^2"
+    "@tauri-apps/plugin-dialog": "^2",
+    "ffmpeg-static": "^5.3.0",
+    "ffprobe-static": "^3.1.0"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2",

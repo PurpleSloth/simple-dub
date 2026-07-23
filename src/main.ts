@@ -1,9 +1,11 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import "./style.css";
 
 type StreamType = "video" | "audio" | "subtitle" | "other";
 type SubtitleKind = "text" | "image" | null;
+type TtsEngineId = "piper-dmitri-fp32" | "silero-v5-5-eugene";
 
 interface StreamInfo {
   index: number;
@@ -28,16 +30,44 @@ interface OpenRouterKeyStatus {
   configured: boolean;
 }
 
+interface TtsEngineStatus {
+  id: TtsEngineId;
+  display_name: string;
+  backend: "sherpa-onnx" | "silero-python";
+  model_id: string;
+  speaker: string;
+  sample_rate: number;
+  installed: boolean;
+  status_message: string;
+}
+
+interface JobProgress {
+  percent: number;
+  stage: string;
+  message: string;
+}
+
+interface DubJobResult {
+  outputPath: string;
+  segmentCount: number;
+}
+
+const TTS_ENGINE_STORAGE_KEY = "simple-dub.tts-engine";
+
 const state: {
   path: string | null;
   media: MediaInfo | null;
   audioIndex: number | null;
   subtitleIndex: number | null;
+  ttsEngine: TtsEngineId;
+  ttsStatuses: TtsEngineStatus[];
 } = {
   path: null,
   media: null,
   audioIndex: null,
   subtitleIndex: null,
+  ttsEngine: loadStoredTtsEngine(),
+  ttsStatuses: [],
 };
 
 const app = document.querySelector<HTMLElement>("#app");
@@ -130,8 +160,22 @@ app.innerHTML = `
       </article>
     </section>
 
+    <section id="tts-panel" class="card tts-card is-hidden">
+      <div class="section-title">
+        <span class="step">4</span>
+        <div>
+          <h2>Голос дубляжа</h2>
+          <p>
+            Piper быстрее и легче устанавливается, Silero отличается более
+            мягким тембром.
+          </p>
+        </div>
+      </div>
+      <div id="tts-list" class="choices tts-choices"></div>
+    </section>
+
     <section id="summary" class="card summary is-hidden">
-      <div>
+      <div class="summary-copy">
         <span class="status-dot"></span>
         <div>
           <p class="eyebrow">Маршрут обработки</p>
@@ -139,7 +183,15 @@ app.innerHTML = `
           <p id="route-description"></p>
         </div>
       </div>
-      <button id="prepare-job" class="primary">Подготовить задание</button>
+      <div class="summary-actions">
+        <div id="job-progress" class="job-progress is-hidden">
+          <div class="progress-track">
+            <span id="progress-fill"></span>
+          </div>
+          <small id="progress-message">Подготовка…</small>
+        </div>
+        <button id="prepare-job" class="primary">Начать дубляж</button>
+      </div>
     </section>
 
     <p id="error" class="error" role="alert"></p>
@@ -164,12 +216,18 @@ const fileLabel = document.querySelector<HTMLElement>("#file-label");
 const trackPanel = document.querySelector<HTMLElement>("#track-panel");
 const audioList = document.querySelector<HTMLElement>("#audio-list");
 const subtitleList = document.querySelector<HTMLElement>("#subtitle-list");
+const ttsPanel = document.querySelector<HTMLElement>("#tts-panel");
+const ttsList = document.querySelector<HTMLElement>("#tts-list");
 const summary = document.querySelector<HTMLElement>("#summary");
 const routeTitle = document.querySelector<HTMLElement>("#route-title");
 const routeDescription =
   document.querySelector<HTMLElement>("#route-description");
 const prepareButton =
   document.querySelector<HTMLButtonElement>("#prepare-job");
+const jobProgress = document.querySelector<HTMLElement>("#job-progress");
+const progressFill = document.querySelector<HTMLElement>("#progress-fill");
+const progressMessage =
+  document.querySelector<HTMLElement>("#progress-message");
 const errorBox = document.querySelector<HTMLElement>("#error");
 
 chooseButton?.addEventListener("click", chooseMedia);
@@ -179,15 +237,11 @@ openRouterSettingsForm?.addEventListener("submit", (event) => {
   void saveOpenRouterKey();
 });
 deleteOpenRouterKeyButton?.addEventListener("click", deleteOpenRouterKey);
-prepareButton?.addEventListener("click", () => {
-  if (routeTitle && routeDescription) {
-    routeTitle.textContent = "Первый этап готов";
-    routeDescription.textContent =
-      "Потоки выбраны. Следующий вертикальный срез запустит TTS, перевод или whisper.cpp и соберёт MKV.";
-  }
-});
+prepareButton?.addEventListener("click", () => void startDubJob());
 
 void refreshOpenRouterKeyStatus();
+void refreshTtsEngineStatuses();
+void subscribeToJobProgress();
 
 function toggleSettings(): void {
   settingsPanel?.classList.toggle("is-hidden");
@@ -242,6 +296,97 @@ async function deleteOpenRouterKey(): Promise<void> {
     setOpenRouterStatus(String(error), true);
   } finally {
     setSettingsBusy(false);
+  }
+}
+
+async function refreshTtsEngineStatuses(): Promise<void> {
+  if (!isTauriRuntime()) {
+    state.ttsStatuses = fallbackTtsStatuses();
+    renderTtsChoices();
+    return;
+  }
+
+  try {
+    state.ttsStatuses =
+      await invoke<TtsEngineStatus[]>("tts_engine_statuses");
+  } catch (error) {
+    showError(`Не удалось проверить TTS-компоненты: ${String(error)}`);
+    state.ttsStatuses = fallbackTtsStatuses();
+  }
+
+  renderTtsChoices();
+}
+
+async function subscribeToJobProgress(): Promise<void> {
+  if (!isTauriRuntime()) {
+    return;
+  }
+  await listen<JobProgress>("job-progress", (event) => {
+    renderJobProgress(event.payload);
+  });
+}
+
+async function startDubJob(): Promise<void> {
+  clearError();
+  if (!state.path || !state.media || state.audioIndex === null) {
+    showError("Сначала выберите видео и оригинальную аудиодорожку.");
+    return;
+  }
+  if (!isTauriRuntime()) {
+    showError("Запуск дубляжа доступен в desktop-приложении.");
+    return;
+  }
+
+  const subtitle = state.media.streams.find(
+    (stream) => stream.index === state.subtitleIndex,
+  );
+  prepareButton?.setAttribute("disabled", "true");
+  jobProgress?.classList.remove("is-hidden");
+  renderJobProgress({
+    percent: 0,
+    stage: "prepare",
+    message: "Запуск задания…",
+  });
+
+  try {
+    const result = await invoke<DubJobResult>("start_dub_job", {
+      request: {
+        inputPath: state.path,
+        audioStreamIndex: state.audioIndex,
+        subtitleStreamIndex: state.subtitleIndex,
+        subtitleKind: subtitle?.subtitle_kind ?? null,
+        subtitleLanguage: subtitle?.language ?? null,
+        existingAudioStreams: state.media.streams.filter(
+          (stream) => stream.stream_type === "audio",
+        ).length,
+        durationSeconds: state.media.duration_seconds ?? 0,
+        ttsEngine: state.ttsEngine,
+        originalVolume: 0.3,
+      },
+    });
+    if (routeTitle && routeDescription) {
+      routeTitle.textContent = "Дубляж готов";
+      routeDescription.textContent =
+        `${result.segmentCount} реплик · ${result.outputPath}`;
+    }
+  } catch (error) {
+    showError(String(error));
+    if (routeTitle) {
+      routeTitle.textContent = "Задание остановлено";
+    }
+  } finally {
+    prepareButton?.removeAttribute("disabled");
+    await refreshTtsEngineStatuses();
+  }
+}
+
+function renderJobProgress(progress: JobProgress): void {
+  const percent = Math.max(0, Math.min(100, progress.percent));
+  if (progressFill) {
+    progressFill.style.width = `${percent}%`;
+  }
+  if (progressMessage) {
+    progressMessage.textContent = `${percent}% · ${progress.message}`;
   }
 }
 
@@ -339,7 +484,9 @@ function renderMedia(): void {
 
   renderAudioChoices();
   renderSubtitleChoices();
+  renderTtsChoices();
   trackPanel?.classList.remove("is-hidden");
+  ttsPanel?.classList.remove("is-hidden");
   summary?.classList.remove("is-hidden");
   updateRoute();
 }
@@ -432,6 +579,53 @@ function renderSubtitleChoices(): void {
     );
 }
 
+function renderTtsChoices(): void {
+  if (!ttsList) {
+    return;
+  }
+
+  ttsList.innerHTML = state.ttsStatuses
+    .map((status) => {
+      const backend =
+        status.backend === "sherpa-onnx"
+          ? "Нативный ONNX"
+          : "Python/PyTorch под управлением приложения";
+      const readiness = status.installed
+        ? "Компонент установлен"
+        : "Компонент потребуется установить";
+      return `
+        <label class="choice tts-choice">
+          <input
+            type="radio"
+            name="tts-engine"
+            value="${status.id}"
+            ${state.ttsEngine === status.id ? "checked" : ""}
+          />
+          <span>
+            <strong>${escapeHtml(status.display_name)}</strong>
+            <small>
+              ${backend} · ${(status.sample_rate / 1_000).toFixed(2)} kHz
+            </small>
+            <small class="${status.installed ? "runtime-ready" : "runtime-missing"}">
+              ${readiness}
+            </small>
+          </span>
+        </label>
+      `;
+    })
+    .join("");
+
+  ttsList
+    .querySelectorAll<HTMLInputElement>('input[name="tts-engine"]')
+    .forEach((input) =>
+      input.addEventListener("change", () => {
+        state.ttsEngine = input.value as TtsEngineId;
+        localStorage.setItem(TTS_ENGINE_STORAGE_KEY, state.ttsEngine);
+        updateRoute();
+      }),
+    );
+}
+
 function updateRoute(): void {
   if (!state.media || !routeTitle || !routeDescription) {
     return;
@@ -444,20 +638,30 @@ function updateRoute(): void {
   if (!subtitle || subtitle.subtitle_kind === "image") {
     routeTitle.textContent = "Распознать и перевести";
     routeDescription.textContent =
-      "Выбранная аудиодорожка → whisper.cpp → Gemini 3.5 Flash Lite → Silero v5_5_ru.";
+      `Выбранная аудиодорожка → whisper.cpp → Gemini 3.5 Flash Lite → ${selectedTtsName()}.`;
     return;
   }
 
   if (isRussian(subtitle.language)) {
     routeTitle.textContent = "Озвучить русские субтитры";
     routeDescription.textContent =
-      "Перевод не нужен: текст сразу отправится в Silero v5_5_ru.";
+      `Перевод не нужен: текст сразу отправится в ${selectedTtsName()}.`;
     return;
   }
 
   routeTitle.textContent = "Перевести и озвучить";
   routeDescription.textContent =
-    "Текстовые субтитры → Gemini 3.5 Flash Lite → Silero v5_5_ru.";
+    `Текстовые субтитры → Gemini 3.5 Flash Lite → ${selectedTtsName()}.`;
+}
+
+function selectedTtsName(): string {
+  return (
+    state.ttsStatuses.find((status) => status.id === state.ttsEngine)
+      ?.display_name ??
+    (state.ttsEngine === "silero-v5-5-eugene"
+      ? "Silero 5.5 · Eugene"
+      : "Piper · Dmitri FP32")
+  );
 }
 
 function trackMeta(stream: StreamInfo): string {
@@ -473,6 +677,38 @@ function trackMeta(stream: StreamInfo): string {
 
 function isRussian(language: string | null): boolean {
   return ["ru", "rus", "russian"].includes(language?.toLowerCase() ?? "");
+}
+
+function loadStoredTtsEngine(): TtsEngineId {
+  const stored = localStorage.getItem(TTS_ENGINE_STORAGE_KEY);
+  return stored === "silero-v5-5-eugene"
+    ? "silero-v5-5-eugene"
+    : "piper-dmitri-fp32";
+}
+
+function fallbackTtsStatuses(): TtsEngineStatus[] {
+  return [
+    {
+      id: "piper-dmitri-fp32",
+      display_name: "Piper · Dmitri FP32",
+      backend: "sherpa-onnx",
+      model_id: "ru_RU-dmitri-medium",
+      speaker: "dmitri",
+      sample_rate: 22_050,
+      installed: false,
+      status_message: "Статус доступен в установленном приложении.",
+    },
+    {
+      id: "silero-v5-5-eugene",
+      display_name: "Silero 5.5 · Eugene",
+      backend: "silero-python",
+      model_id: "v5_5_ru",
+      speaker: "eugene",
+      sample_rate: 48_000,
+      installed: false,
+      status_message: "Статус доступен в установленном приложении.",
+    },
+  ];
 }
 
 function escapeHtml(value: string): string {

@@ -161,9 +161,7 @@ pub fn parse_ffprobe_json(json: &str) -> Result<MediaInfo, MediaProbeError> {
 
 fn classify_subtitle(codec_name: Option<&str>) -> SubtitleKind {
     match codec_name.unwrap_or_default() {
-        "hdmv_pgs_subtitle" | "dvd_subtitle" | "dvb_subtitle" | "xsub" => {
-            SubtitleKind::Image
-        }
+        "hdmv_pgs_subtitle" | "dvd_subtitle" | "dvb_subtitle" | "xsub" => SubtitleKind::Image,
         _ => SubtitleKind::Text,
     }
 }
