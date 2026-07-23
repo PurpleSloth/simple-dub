@@ -1,0 +1,39 @@
+# Секреты и локальная конфигурация
+.env
+.env.*
+!.env.example
+
+# Python
+*.py
+env/
+.venv/
+__pycache__/
+*.py[cod]
+
+# Медиа, модели и рабочие результаты
+*.mp4
+*.mkv
+*.avi
+*.mov
+*.wav
+*.mp3
+*.flac
+*.bin
+output/
+temp/
+models/
+runtime/
+_legacy_python/
+
+# Rust / Tauri / Node.js
+target/
+src-tauri/target/
+node_modules/
+dist/
+.playwright-cli/
+
+# IDE и ОС
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

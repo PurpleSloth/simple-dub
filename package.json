@@ -1,0 +1,21 @@
+{
+  "name": "simple-dub",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "check:secrets": "pwsh -NoProfile -File scripts/check-secrets.ps1",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2",
+    "@tauri-apps/plugin-dialog": "^2"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2",
+    "typescript": "^5",
+    "vite": "^7"
+  }
+}
