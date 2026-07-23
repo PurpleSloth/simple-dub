@@ -50,6 +50,7 @@ interface JobProgress {
 interface DubJobResult {
   outputPath: string;
   segmentCount: number;
+  skippedSegmentCount: number;
 }
 
 const TTS_ENGINE_STORAGE_KEY = "simple-dub.tts-engine";
@@ -366,8 +367,12 @@ async function startDubJob(): Promise<void> {
     });
     if (routeTitle && routeDescription) {
       routeTitle.textContent = "Дубляж готов";
+      const skipped =
+        result.skippedSegmentCount > 0
+          ? ` · пропущено ${result.skippedSegmentCount}`
+          : "";
       routeDescription.textContent =
-        `${result.segmentCount} реплик · ${result.outputPath}`;
+        `${result.segmentCount} реплик${skipped} · ${result.outputPath}`;
     }
   } catch (error) {
     showError(String(error));

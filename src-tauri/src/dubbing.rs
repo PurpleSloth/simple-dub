@@ -37,6 +37,7 @@ pub struct DubJobRequest {
 pub struct DubJobResult {
     pub output_path: String,
     pub segment_count: usize,
+    pub skipped_segment_count: usize,
 }
 
 /// Событие прогресса для интерфейса.
@@ -95,10 +96,13 @@ pub fn run_dub_job(
         return Err("Не найдено ни одной реплики для озвучки.".to_owned());
     }
 
+    let mut skipped_segment_count = 0;
     if needs_translation {
         emit(progress, 26, "translate", "Перевод реплик на русский");
         let key = OpenRouterCredentialStore::new()?.read()?;
-        segments = translate_segments(progress, &key, &segments)?;
+        let translation = translate_segments(progress, &key, &segments)?;
+        segments = translation.segments;
+        skipped_segment_count = translation.skipped_count;
     }
     fs::write(work_dir.join("russian.srt"), write_srt(&segments))
         .map_err(|error| format!("Не удалось сохранить русские субтитры: {error}"))?;
@@ -153,6 +157,7 @@ pub fn run_dub_job(
     let result = DubJobResult {
         output_path: output_path.to_string_lossy().into_owned(),
         segment_count: segments.len(),
+        skipped_segment_count,
     };
     fs::remove_dir_all(&work_dir).ok();
     Ok(result)
@@ -263,82 +268,172 @@ struct OpenRouterMessage {
     content: String,
 }
 
+struct TranslationBatchResult {
+    segments: Vec<SubtitleSegment>,
+    skipped_count: usize,
+}
+
 fn translate_segments(
     progress: &ProgressReporter,
     key: &str,
     segments: &[SubtitleSegment],
-) -> Result<Vec<SubtitleSegment>, String> {
+) -> Result<TranslationBatchResult, String> {
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(180))
         .build()
         .map_err(|error| format!("Не удалось создать HTTP-клиент: {error}"))?;
     let mut translated = Vec::with_capacity(segments.len());
+    let mut skipped_count = 0;
     let batches = segments.len().div_ceil(24);
 
     for (batch_index, batch) in segments.chunks(24).enumerate() {
-        let input: Vec<_> = batch
-            .iter()
-            .map(|segment| TranslationInput {
-                id: &segment.id,
-                duration_seconds: segment.duration_ms() as f64 / 1_000.0,
-                text: &segment.text,
-            })
-            .collect();
-        let prompt = format!(
-            "Переведи реплики на естественный разговорный русский для одноголосого \
-             дубляжа. Сохрани смысл, имена и порядок. Каждая фраза должна реально \
-             помещаться в duration_seconds при нормальном темпе речи; сокращай \
-             формулировку, но не добавляй новых фактов. Верни только JSON-объект \
-             {{\"segments\":[{{\"id\":\"...\",\"text\":\"...\"}}]}} с теми же id.\n\n{}",
-            serde_json::to_string(&input)
-                .map_err(|error| format!("Не удалось подготовить перевод: {error}"))?
+        let batch_result = translate_with_fallback(batch, 3, Duration::from_millis(750), |items| {
+            translate_batch_once(&client, key, items)
+        });
+        translated.extend(batch_result.segments);
+        skipped_count += batch_result.skipped_count;
+        let percent = 26 + (((batch_index + 1) * 14) / batches.max(1)) as u8;
+        emit(
+            progress,
+            percent,
+            "translate",
+            &format!(
+                "Переведено {} из {} реплик, пропущено {}",
+                translated.len(),
+                segments.len(),
+                skipped_count
+            ),
         );
-        let response = client
-            .post("https://openrouter.ai/api/v1/chat/completions")
-            .bearer_auth(key)
-            .header("X-Title", "Simple Dub")
-            .json(&serde_json::json!({
-                "model": TRANSLATION_MODEL,
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": "Ты профессиональный переводчик субтитров для озвучки."
-                    },
-                    {"role": "user", "content": prompt}
-                ],
-                "temperature": 0.2,
-                "reasoning": {"effort": "minimal", "exclude": true},
-                "response_format": {"type": "json_object"}
-            }))
-            .send()
-            .map_err(|error| format!("Ошибка OpenRouter: {error}"))?;
-        let status = response.status();
-        let body = response
-            .text()
-            .map_err(|error| format!("Не удалось прочитать ответ OpenRouter: {error}"))?;
-        if !status.is_success() {
-            return Err(format!("OpenRouter вернул {status}: {body}"));
+    }
+    Ok(TranslationBatchResult {
+        segments: translated,
+        skipped_count,
+    })
+}
+
+fn translate_with_fallback<F>(
+    batch: &[SubtitleSegment],
+    max_attempts: usize,
+    retry_delay: Duration,
+    mut translate: F,
+) -> TranslationBatchResult
+where
+    F: FnMut(&[SubtitleSegment]) -> Result<Vec<SubtitleSegment>, String>,
+{
+    if let Ok(segments) = retry_translation(batch, max_attempts, retry_delay, &mut translate) {
+        return TranslationBatchResult {
+            segments,
+            skipped_count: 0,
+        };
+    }
+    if batch.len() == 1 {
+        return TranslationBatchResult {
+            segments: Vec::new(),
+            skipped_count: 1,
+        };
+    }
+
+    let mut translated = Vec::with_capacity(batch.len());
+    let mut skipped_count = 0;
+    for segment in batch {
+        match retry_translation(
+            std::slice::from_ref(segment),
+            max_attempts,
+            retry_delay,
+            &mut translate,
+        ) {
+            Ok(mut item) => translated.append(&mut item),
+            Err(_) => skipped_count += 1,
         }
-        let response: OpenRouterResponse = serde_json::from_str(&body)
-            .map_err(|error| format!("Неверный ответ OpenRouter: {error}"))?;
-        let content = response
-            .choices
-            .first()
-            .ok_or("OpenRouter не вернул вариант перевода")?
-            .message
-            .content
-            .trim();
-        let json = extract_json_object(content)?;
-        let envelope: TranslationEnvelope = serde_json::from_str(json)
-            .map_err(|error| format!("Модель вернула неверный JSON: {error}"))?;
-        if envelope.segments.len() != batch.len() {
-            return Err(format!(
-                "Модель вернула {} реплик вместо {}",
-                envelope.segments.len(),
-                batch.len()
-            ));
+    }
+    TranslationBatchResult {
+        segments: translated,
+        skipped_count,
+    }
+}
+
+fn retry_translation<F>(
+    batch: &[SubtitleSegment],
+    max_attempts: usize,
+    retry_delay: Duration,
+    translate: &mut F,
+) -> Result<Vec<SubtitleSegment>, String>
+where
+    F: FnMut(&[SubtitleSegment]) -> Result<Vec<SubtitleSegment>, String>,
+{
+    let attempts = max_attempts.max(1);
+    let mut last_error = String::new();
+    for attempt in 0..attempts {
+        match translate(batch) {
+            Ok(segments) => return Ok(segments),
+            Err(error) => last_error = error,
         }
-        for original in batch {
+        if attempt + 1 < attempts && !retry_delay.is_zero() {
+            std::thread::sleep(retry_delay);
+        }
+    }
+    Err(last_error)
+}
+
+fn translate_batch_once(
+    client: &reqwest::blocking::Client,
+    key: &str,
+    batch: &[SubtitleSegment],
+) -> Result<Vec<SubtitleSegment>, String> {
+    let input: Vec<_> = batch
+        .iter()
+        .map(|segment| TranslationInput {
+            id: &segment.id,
+            duration_seconds: segment.duration_ms() as f64 / 1_000.0,
+            text: &segment.text,
+        })
+        .collect();
+    let prompt = format!(
+        "Переведи реплики на естественный разговорный русский для одноголосого \
+         дубляжа. Сохрани смысл, имена и порядок. Каждая фраза должна реально \
+         помещаться в duration_seconds при нормальном темпе речи; сокращай \
+         формулировку, но не добавляй новых фактов. Верни объект с массивом \
+         segments и теми же id.\n\n{}",
+        serde_json::to_string(&input)
+            .map_err(|error| format!("Не удалось подготовить перевод: {error}"))?
+    );
+    let response = client
+        .post("https://openrouter.ai/api/v1/chat/completions")
+        .bearer_auth(key)
+        .header("X-Title", "Simple Dub")
+        .json(&translation_request_body(&prompt, batch.len()))
+        .send()
+        .map_err(|error| format!("Ошибка OpenRouter: {error}"))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .map_err(|error| format!("Не удалось прочитать ответ OpenRouter: {error}"))?;
+    if !status.is_success() {
+        return Err(format!("OpenRouter вернул {status}: {body}"));
+    }
+    let response: OpenRouterResponse = serde_json::from_str(&body)
+        .map_err(|error| format!("Неверный ответ OpenRouter: {error}"))?;
+    let content = response
+        .choices
+        .first()
+        .ok_or("OpenRouter не вернул вариант перевода")?
+        .message
+        .content
+        .trim();
+    let json = extract_json_object(content)?;
+    let envelope: TranslationEnvelope = serde_json::from_str(json)
+        .map_err(|error| format!("Модель вернула неверный JSON: {error}"))?;
+    if envelope.segments.len() != batch.len() {
+        return Err(format!(
+            "Модель вернула {} реплик вместо {}",
+            envelope.segments.len(),
+            batch.len()
+        ));
+    }
+
+    batch
+        .iter()
+        .map(|original| {
             let item = envelope
                 .segments
                 .iter()
@@ -348,26 +443,57 @@ fn translate_segments(
             if text.is_empty() {
                 return Err(format!("Пустой перевод для id {}", original.id));
             }
-            translated.push(SubtitleSegment {
+            Ok(SubtitleSegment {
                 id: original.id.clone(),
                 start_ms: original.start_ms,
                 end_ms: original.end_ms,
                 text: text.to_owned(),
-            });
+            })
+        })
+        .collect()
+}
+
+fn translation_request_body(prompt: &str, expected_segments: usize) -> serde_json::Value {
+    serde_json::json!({
+        "model": TRANSLATION_MODEL,
+        "messages": [
+            {
+                "role": "system",
+                "content": "Ты профессиональный переводчик субтитров для озвучки."
+            },
+            {"role": "user", "content": prompt}
+        ],
+        "temperature": 0.2,
+        "reasoning": {"effort": "minimal", "exclude": true},
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "subtitle_translation",
+                "strict": true,
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "segments": {
+                            "type": "array",
+                            "minItems": expected_segments,
+                            "maxItems": expected_segments,
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "id": {"type": "string"},
+                                    "text": {"type": "string", "minLength": 1}
+                                },
+                                "required": ["id", "text"],
+                                "additionalProperties": false
+                            }
+                        }
+                    },
+                    "required": ["segments"],
+                    "additionalProperties": false
+                }
+            }
         }
-        let percent = 26 + (((batch_index + 1) * 14) / batches.max(1)) as u8;
-        emit(
-            progress,
-            percent,
-            "translate",
-            &format!(
-                "Переведено {} из {} реплик",
-                translated.len(),
-                segments.len()
-            ),
-        );
-    }
-    Ok(translated)
+    })
 }
 
 fn synthesize_segments(
@@ -735,4 +861,86 @@ fn emit_tts_progress(progress: &ProgressReporter, complete: usize, total: usize)
         "tts",
         &format!("Озвучено {complete} из {total} реплик"),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn segment(id: &str, text: &str) -> SubtitleSegment {
+        SubtitleSegment {
+            id: id.to_owned(),
+            start_ms: 0,
+            end_ms: 1_000,
+            text: text.to_owned(),
+        }
+    }
+
+    #[test]
+    fn translation_request_uses_strict_json_schema() {
+        let body = translation_request_body("prompt", 2);
+        let response_format = &body["response_format"];
+
+        assert_eq!(response_format["type"], "json_schema");
+        assert_eq!(response_format["json_schema"]["strict"], true);
+        assert_eq!(
+            response_format["json_schema"]["schema"]["additionalProperties"],
+            false
+        );
+        assert_eq!(
+            response_format["json_schema"]["schema"]["properties"]["segments"]["minItems"],
+            2
+        );
+        assert_eq!(
+            response_format["json_schema"]["schema"]["properties"]["segments"]["maxItems"],
+            2
+        );
+    }
+
+    #[test]
+    fn translation_retries_a_failed_batch() {
+        let input = vec![segment("1", "Hello")];
+        let mut attempts = 0;
+
+        let result = translate_with_fallback(&input, 3, Duration::ZERO, |batch| {
+            attempts += 1;
+            if attempts == 1 {
+                return Err("invalid JSON".to_owned());
+            }
+            Ok(batch
+                .iter()
+                .map(|item| segment(&item.id, "Привет"))
+                .collect())
+        });
+
+        assert_eq!(attempts, 2);
+        assert_eq!(result.segments.len(), 1);
+        assert_eq!(result.segments[0].text, "Привет");
+        assert_eq!(result.skipped_count, 0);
+    }
+
+    #[test]
+    fn translation_skips_only_the_item_that_fails_three_times() {
+        let input = vec![segment("1", "Hello"), segment("2", "Goodbye")];
+        let mut batch_attempts = 0;
+        let mut second_item_attempts = 0;
+
+        let result = translate_with_fallback(&input, 3, Duration::ZERO, |batch| {
+            if batch.len() > 1 {
+                batch_attempts += 1;
+                return Err("invalid batch JSON".to_owned());
+            }
+            if batch[0].id == "2" {
+                second_item_attempts += 1;
+                return Err("invalid item JSON".to_owned());
+            }
+            Ok(vec![segment("1", "Привет")])
+        });
+
+        assert_eq!(batch_attempts, 3);
+        assert_eq!(second_item_attempts, 3);
+        assert_eq!(result.segments.len(), 1);
+        assert_eq!(result.segments[0].id, "1");
+        assert_eq!(result.skipped_count, 1);
+    }
 }
