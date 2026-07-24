@@ -93,7 +93,7 @@ fn preserves_existing_mkv_streams_and_adds_dub_audio() {
         dubbed_audio_path: &dubbed,
         output_path: &output,
         existing_audio_streams: 2,
-        make_default: false,
+        make_default: true,
     });
     let mux_refs: Vec<&str> = mux_args.iter().map(String::as_str).collect();
     run(&ffmpeg, &mux_refs);
@@ -120,7 +120,9 @@ fn preserves_existing_mkv_streams_and_adds_dub_audio() {
     let dub = media.audio_streams()[2];
     assert_eq!(dub.language.as_deref(), Some("rus"));
     assert_eq!(dub.title.as_deref(), Some("Русский одноголосый дубляж"));
-    assert!(!dub.is_default);
+    assert!(!media.audio_streams()[0].is_default);
+    assert!(!media.audio_streams()[1].is_default);
+    assert!(dub.is_default);
 }
 
 fn find_ffmpeg(name: &str) -> Option<PathBuf> {

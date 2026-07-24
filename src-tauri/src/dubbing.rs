@@ -1,8 +1,10 @@
 //! Исполняемый конвейер одноголосого дубляжа.
 
 use std::fs;
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
+use std::thread;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -15,6 +17,8 @@ use crate::settings::OpenRouterCredentialStore;
 
 const TRANSLATION_MODEL: &str = "google/gemini-3.5-flash-lite";
 const TARGET_SAMPLE_RATE: u32 = 48_000;
+const TARGET_VOICE_LUFS: f32 = -16.0;
+const DUCKING_RATIO: f32 = 20.0;
 
 /// Параметры запуска полного задания из интерфейса.
 #[derive(Debug, Clone, Deserialize)]
@@ -28,7 +32,7 @@ pub struct DubJobRequest {
     pub existing_audio_streams: usize,
     pub duration_seconds: f64,
     pub tts_engine: TtsEngine,
-    pub original_volume: f32,
+    pub ducking_gap_db: f32,
 }
 
 /// Итог успешно завершённого задания.
@@ -38,6 +42,11 @@ pub struct DubJobResult {
     pub output_path: String,
     pub segment_count: usize,
     pub skipped_segment_count: usize,
+    pub voice_lufs: f32,
+    pub original_lufs: f32,
+    pub mix_lufs: f32,
+    pub mix_true_peak_dbfs: f32,
+    pub ducking_db: f32,
 }
 
 /// Событие прогресса для интерфейса.
@@ -46,6 +55,8 @@ pub struct DubJobResult {
 pub struct JobProgress {
     pub percent: u8,
     pub stage: &'static str,
+    pub stage_index: u8,
+    pub stage_count: u8,
     pub message: String,
 }
 
@@ -73,6 +84,35 @@ impl ProgressReporter {
     }
 }
 
+#[derive(Clone)]
+struct StageProgress {
+    reporter: ProgressReporter,
+    index: u8,
+    count: u8,
+    stage: &'static str,
+}
+
+impl StageProgress {
+    fn new(reporter: &ProgressReporter, index: u8, count: u8, stage: &'static str) -> Self {
+        Self {
+            reporter: reporter.clone(),
+            index,
+            count,
+            stage,
+        }
+    }
+
+    fn emit(&self, percent: u8, message: &str) {
+        self.reporter.emit(JobProgress {
+            percent: percent.min(100),
+            stage: self.stage,
+            stage_index: self.index,
+            stage_count: self.count,
+            message: message.to_owned(),
+        });
+    }
+}
+
 /// Выполнить полный конвейер в блокирующем worker-потоке.
 pub fn run_dub_job(
     progress: &ProgressReporter,
@@ -89,41 +129,67 @@ pub fn run_dub_job(
     fs::create_dir_all(&work_dir)
         .map_err(|error| format!("Не удалось создать рабочий каталог: {error}"))?;
 
-    emit(progress, 2, "prepare", "Подготовка временных файлов");
-    let (mut segments, needs_translation) =
-        obtain_segments(progress, runtime_root, &ffmpeg, request, &work_dir)?;
+    let uses_text_subtitles =
+        request.subtitle_stream_index.is_some() && request.subtitle_kind.as_deref() == Some("text");
+    let needs_translation =
+        !uses_text_subtitles || !is_russian(request.subtitle_language.as_deref());
+    let stage_count = 5 + u8::from(!uses_text_subtitles) + u8::from(needs_translation);
+    let mut stage_index = 1;
+
+    let prepare_stage = StageProgress::new(progress, stage_index, stage_count, "prepare");
+    stage_index += 1;
+    let asr_stage = if uses_text_subtitles {
+        None
+    } else {
+        let stage = StageProgress::new(progress, stage_index, stage_count, "asr");
+        stage_index += 1;
+        Some(stage)
+    };
+    let (mut segments, needs_translation) = obtain_segments(
+        &prepare_stage,
+        asr_stage.as_ref(),
+        runtime_root,
+        &ffmpeg,
+        request,
+        &work_dir,
+    )?;
     if segments.is_empty() {
         return Err("Не найдено ни одной реплики для озвучки.".to_owned());
     }
 
     let mut skipped_segment_count = 0;
     if needs_translation {
-        emit(progress, 26, "translate", "Перевод реплик на русский");
+        let translate_stage = StageProgress::new(progress, stage_index, stage_count, "translate");
+        stage_index += 1;
+        translate_stage.emit(0, "Перевод реплик на русский");
         let key = OpenRouterCredentialStore::new()?.read()?;
-        let translation = translate_segments(progress, &key, &segments)?;
+        let translation = translate_segments(&translate_stage, &key, &segments)?;
         segments = translation.segments;
         skipped_segment_count = translation.skipped_count;
     }
     fs::write(work_dir.join("russian.srt"), write_srt(&segments))
         .map_err(|error| format!("Не удалось сохранить русские субтитры: {error}"))?;
 
-    emit(
-        progress,
-        42,
-        "tts",
+    let tts_stage = StageProgress::new(progress, stage_index, stage_count, "tts");
+    stage_index += 1;
+    tts_stage.emit(
+        0,
         &format!("Озвучка через {}", request.tts_engine.display_name()),
     );
     let audio_fragments = synthesize_segments(
-        progress,
+        &tts_stage,
         runtime_root,
         request.tts_engine,
         &segments,
         &work_dir,
     )?;
 
-    emit(progress, 78, "align", "Выравнивание реплик по таймкодам");
+    let align_stage = StageProgress::new(progress, stage_index, stage_count, "align");
+    stage_index += 1;
+    align_stage.emit(0, "Выравнивание реплик по таймкодам");
     let voice_track = work_dir.join("voice.wav");
     assemble_voice_track(
+        &align_stage,
         &ffmpeg,
         &segments,
         &audio_fragments,
@@ -132,39 +198,119 @@ pub fn run_dub_job(
         &voice_track,
     )?;
 
-    emit(progress, 88, "mix", "Смешивание с приглушённым оригиналом");
+    let balance_stage = StageProgress::new(progress, stage_index, stage_count, "balance");
+    stage_index += 1;
+    balance_stage.emit(0, "Анализ громкости оригинала");
+    let original_loudness = measure_loudness(
+        &balance_stage,
+        &ffmpeg,
+        &LoudnessJob {
+            input: &input_path,
+            stream_index: Some(request.audio_stream_index),
+            duration_seconds: request.duration_seconds,
+            message: "Анализ громкости оригинала",
+            start_percent: 0,
+            end_percent: 20,
+        },
+    )?;
+    balance_stage.emit(
+        20,
+        &format!(
+            "Оригинал {:.1} LUFS · анализ громкости дубляжа",
+            original_loudness.integrated_lufs
+        ),
+    );
+    let voice_loudness = measure_loudness(
+        &balance_stage,
+        &ffmpeg,
+        &LoudnessJob {
+            input: &voice_track,
+            stream_index: None,
+            duration_seconds: request.duration_seconds,
+            message: "Анализ громкости дубляжа",
+            start_percent: 20,
+            end_percent: 35,
+        },
+    )?;
+    let loudness_plan = plan_loudness_mix(
+        original_loudness.integrated_lufs,
+        voice_loudness.integrated_lufs,
+        TARGET_VOICE_LUFS,
+        request.ducking_gap_db,
+    );
+    balance_stage.emit(
+        35,
+        &format!(
+            "Голос {:.1} → {:.1} LUFS · приглушение оригинала {:.1} dB",
+            voice_loudness.integrated_lufs,
+            loudness_plan.normalized_voice_lufs,
+            loudness_plan.bed_reduction_db
+        ),
+    );
     let mixed_audio = work_dir.join("dubbed.mka");
     mix_audio(
+        &balance_stage,
         &ffmpeg,
-        &input_path,
-        request.audio_stream_index,
-        request.original_volume,
-        &voice_track,
-        &mixed_audio,
+        &MixAudioJob {
+            input: &input_path,
+            audio_stream_index: request.audio_stream_index,
+            loudness_plan: &loudness_plan,
+            voice_track: &voice_track,
+            output: &mixed_audio,
+            duration_seconds: request.duration_seconds,
+        },
     )?;
+    balance_stage.emit(85, "Проверка итоговой громкости и пиков");
+    let mix_loudness = measure_loudness(
+        &balance_stage,
+        &ffmpeg,
+        &LoudnessJob {
+            input: &mixed_audio,
+            stream_index: None,
+            duration_seconds: request.duration_seconds,
+            message: "Проверка итоговой громкости и пиков",
+            start_percent: 85,
+            end_percent: 100,
+        },
+    )?;
+    balance_stage.emit(
+        100,
+        &format!(
+            "Микс {:.1} LUFS · пик {:.1} dBFS",
+            mix_loudness.integrated_lufs, mix_loudness.true_peak_dbfs
+        ),
+    );
 
-    emit(progress, 95, "mux", "Добавление новой дорожки в MKV");
+    let mux_stage = StageProgress::new(progress, stage_index, stage_count, "mux");
+    mux_stage.emit(0, "Добавление новой дорожки в MKV");
     let output_path = output_path_for(&input_path);
     mux_output(
+        &mux_stage,
         &ffmpeg,
         &input_path,
         &mixed_audio,
         &output_path,
         request.existing_audio_streams,
+        request.duration_seconds,
     )?;
 
-    emit(progress, 100, "done", "Дубляж готов");
     let result = DubJobResult {
         output_path: output_path.to_string_lossy().into_owned(),
         segment_count: segments.len(),
         skipped_segment_count,
+        voice_lufs: loudness_plan.normalized_voice_lufs,
+        original_lufs: original_loudness.integrated_lufs,
+        mix_lufs: mix_loudness.integrated_lufs,
+        mix_true_peak_dbfs: mix_loudness.true_peak_dbfs,
+        ducking_db: loudness_plan.bed_reduction_db,
     };
     fs::remove_dir_all(&work_dir).ok();
     Ok(result)
 }
 
 fn obtain_segments(
-    progress: &ProgressReporter,
+    prepare_stage: &StageProgress,
+    asr_stage: Option<&StageProgress>,
     runtime_root: &Path,
     ffmpeg: &Path,
     request: &DubJobRequest,
@@ -173,11 +319,11 @@ fn obtain_segments(
     let uses_text_subtitles =
         request.subtitle_stream_index.is_some() && request.subtitle_kind.as_deref() == Some("text");
     if uses_text_subtitles {
-        emit(progress, 8, "subtitles", "Извлечение выбранных субтитров");
+        prepare_stage.emit(0, "Извлечение выбранных субтитров");
         let subtitle_path = work_dir.join("source.srt");
-        run_checked(
+        run_ffmpeg_with_progress(
             Command::new(ffmpeg)
-                .args(["-y", "-v", "error", "-i"])
+                .args(["-y", "-v", "error", "-progress", "pipe:2", "-nostats", "-i"])
                 .arg(&request.input_path)
                 .args([
                     "-map",
@@ -185,6 +331,11 @@ fn obtain_segments(
                 ])
                 .arg(&subtitle_path),
             "Не удалось извлечь субтитры",
+            prepare_stage,
+            request.duration_seconds,
+            "Извлечение выбранных субтитров",
+            0,
+            100,
         )?;
         let content = fs::read_to_string(&subtitle_path)
             .map_err(|error| format!("Не удалось прочитать SRT: {error}"))?;
@@ -193,19 +344,25 @@ fn obtain_segments(
         return Ok((segments, needs_translation));
     }
 
-    emit(progress, 8, "asr", "Извлечение оригинальной аудиодорожки");
+    prepare_stage.emit(0, "Извлечение оригинальной аудиодорожки");
     let asr_audio = work_dir.join("asr.wav");
-    run_checked(
+    run_ffmpeg_with_progress(
         Command::new(ffmpeg)
-            .args(["-y", "-v", "error", "-i"])
+            .args(["-y", "-v", "error", "-progress", "pipe:2", "-nostats", "-i"])
             .arg(&request.input_path)
             .args(["-map", &format!("0:{}", request.audio_stream_index)])
             .args(["-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le"])
             .arg(&asr_audio),
         "Не удалось подготовить аудио для Whisper",
+        prepare_stage,
+        request.duration_seconds,
+        "Извлечение оригинальной аудиодорожки",
+        0,
+        100,
     )?;
 
-    emit(progress, 15, "asr", "Распознавание речи через whisper.cpp");
+    let asr_stage = asr_stage.ok_or("Не задан этап распознавания Whisper")?;
+    asr_stage.emit(0, "Загрузка модели whisper.cpp");
     let whisper = resolve_tool(runtime_root, "whisper-cli.exe", "whisper-cli.exe")?;
     let model = runtime_root.join("models").join("ggml-large-v3-turbo.bin");
     if !model.is_file() {
@@ -228,7 +385,7 @@ fn obtain_segments(
     if vad.is_file() {
         command.args(["--vad", "--vad-model"]).arg(vad);
     }
-    run_checked(&mut command, "Whisper не смог распознать речь")?;
+    run_whisper_with_progress(&mut command, "Whisper не смог распознать речь", asr_stage)?;
     let content = fs::read_to_string(output_base.with_extension("srt"))
         .map_err(|error| format!("Whisper не создал SRT: {error}"))?;
     let segments = parse_srt(&content).map_err(|error| error.to_string())?;
@@ -274,7 +431,7 @@ struct TranslationBatchResult {
 }
 
 fn translate_segments(
-    progress: &ProgressReporter,
+    progress: &StageProgress,
     key: &str,
     segments: &[SubtitleSegment],
 ) -> Result<TranslationBatchResult, String> {
@@ -292,11 +449,9 @@ fn translate_segments(
         });
         translated.extend(batch_result.segments);
         skipped_count += batch_result.skipped_count;
-        let percent = 26 + (((batch_index + 1) * 14) / batches.max(1)) as u8;
-        emit(
-            progress,
+        let percent = (((batch_index + 1) * 100) / batches.max(1)) as u8;
+        progress.emit(
             percent,
-            "translate",
             &format!(
                 "Переведено {} из {} реплик, пропущено {}",
                 translated.len(),
@@ -497,7 +652,7 @@ fn translation_request_body(prompt: &str, expected_segments: usize) -> serde_jso
 }
 
 fn synthesize_segments(
-    progress: &ProgressReporter,
+    progress: &StageProgress,
     runtime_root: &Path,
     engine: TtsEngine,
     segments: &[SubtitleSegment],
@@ -510,7 +665,7 @@ fn synthesize_segments(
 }
 
 fn synthesize_piper(
-    progress: &ProgressReporter,
+    progress: &StageProgress,
     runtime_root: &Path,
     segments: &[SubtitleSegment],
     work_dir: &Path,
@@ -573,7 +728,7 @@ struct SileroOutput {
 }
 
 fn synthesize_silero(
-    progress: &ProgressReporter,
+    progress: &StageProgress,
     runtime_root: &Path,
     segments: &[SubtitleSegment],
     work_dir: &Path,
@@ -650,6 +805,7 @@ fn synthesize_silero(
 }
 
 fn assemble_voice_track(
+    progress: &StageProgress,
     ffmpeg: &Path,
     segments: &[SubtitleSegment],
     fragments: &[PathBuf],
@@ -702,6 +858,10 @@ fn assemble_voice_track(
                 .map_err(|error| format!("Ошибка записи голоса: {error}"))?;
             cursor += 1;
         }
+        progress.emit(
+            (((position + 1) * 100) / segments.len().max(1)) as u8,
+            &format!("Выровнено {} из {} реплик", position + 1, segments.len()),
+        );
     }
 
     let total_samples = (duration_seconds.max(0.0) * TARGET_SAMPLE_RATE as f64).ceil() as u64;
@@ -716,49 +876,67 @@ fn assemble_voice_track(
         .map_err(|error| format!("Не удалось завершить голосовую дорожку: {error}"))
 }
 
-fn mix_audio(
-    ffmpeg: &Path,
-    input: &Path,
+struct MixAudioJob<'a> {
+    input: &'a Path,
     audio_stream_index: usize,
-    original_volume: f32,
-    voice_track: &Path,
-    output: &Path,
-) -> Result<(), String> {
+    loudness_plan: &'a LoudnessMixPlan,
+    voice_track: &'a Path,
+    output: &'a Path,
+    duration_seconds: f64,
+}
+
+fn mix_audio(progress: &StageProgress, ffmpeg: &Path, job: &MixAudioJob<'_>) -> Result<(), String> {
     let filter = build_mix_filter(&MixOptions {
-        original_volume,
-        input_audio_stream_index: audio_stream_index,
+        input_audio_stream_index: job.audio_stream_index,
+        voice_gain_db: job.loudness_plan.voice_gain_db,
+        ducking_threshold: job.loudness_plan.sidechain_threshold,
+        ducking_ratio: DUCKING_RATIO,
     });
-    run_checked(
+    run_ffmpeg_with_progress(
         Command::new(ffmpeg)
-            .args(["-y", "-v", "error", "-i"])
-            .arg(input)
+            .args(["-y", "-v", "error", "-progress", "pipe:2", "-nostats", "-i"])
+            .arg(job.input)
             .args(["-i"])
-            .arg(voice_track)
+            .arg(job.voice_track)
             .args(["-filter_complex", &filter, "-map", "[mix]"])
             .args(["-c:a", "aac", "-b:a", "192k"])
-            .arg(output),
+            .arg(job.output),
         "Не удалось смешать дубляж с оригиналом",
+        progress,
+        job.duration_seconds,
+        "Смешивание с автоматическим приглушением",
+        35,
+        80,
     )?;
     Ok(())
 }
 
 fn mux_output(
+    progress: &StageProgress,
     ffmpeg: &Path,
     input: &Path,
     mixed_audio: &Path,
     output: &Path,
     existing_audio_streams: usize,
+    duration_seconds: f64,
 ) -> Result<(), String> {
     let args = build_mux_args(&MuxOptions {
         input_path: input,
         dubbed_audio_path: mixed_audio,
         output_path: output,
         existing_audio_streams,
-        make_default: false,
+        make_default: true,
     });
-    run_checked(
-        Command::new(ffmpeg).args(["-y", "-v", "error"]).args(args),
+    run_ffmpeg_with_progress(
+        Command::new(ffmpeg)
+            .args(["-y", "-v", "error", "-progress", "pipe:2", "-nostats"])
+            .args(args),
         "Не удалось собрать итоговый MKV",
+        progress,
+        duration_seconds,
+        "Сборка итогового MKV",
+        0,
+        100,
     )?;
     Ok(())
 }
@@ -777,6 +955,237 @@ fn run_checked(command: &mut Command, context: &str) -> Result<Output, String> {
             stderr.trim().to_owned()
         };
         Err(format!("{context}: {details}"))
+    }
+}
+
+fn run_whisper_with_progress(
+    command: &mut Command,
+    context: &str,
+    progress: &StageProgress,
+) -> Result<Output, String> {
+    run_command_with_progress(
+        command,
+        context,
+        progress,
+        "Распознавание речи",
+        100,
+        parse_whisper_progress,
+    )
+}
+
+fn run_ffmpeg_with_progress(
+    command: &mut Command,
+    context: &str,
+    progress: &StageProgress,
+    duration_seconds: f64,
+    message: &str,
+    start_percent: u8,
+    end_percent: u8,
+) -> Result<Output, String> {
+    run_command_with_progress(command, context, progress, message, end_percent, |line| {
+        parse_ffmpeg_progress(line, duration_seconds)
+            .map(|percent| scale_progress(percent, start_percent, end_percent))
+    })
+}
+
+fn run_command_with_progress<F>(
+    command: &mut Command,
+    context: &str,
+    progress: &StageProgress,
+    message: &str,
+    completion_percent: u8,
+    mut parse_progress: F,
+) -> Result<Output, String>
+where
+    F: FnMut(&str) -> Option<u8>,
+{
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("{context}: {error}"))?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| format!("{context}: не удалось прочитать stdout"))?;
+    let stdout_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes).ok();
+        bytes
+    });
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| format!("{context}: не удалось прочитать stderr"))?;
+    let mut stderr_bytes = Vec::new();
+    let mut last_percent = None;
+    for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+        stderr_bytes.extend_from_slice(line.as_bytes());
+        stderr_bytes.push(b'\n');
+        if let Some(percent) = parse_progress(&line)
+            && last_percent != Some(percent)
+        {
+            progress.emit(percent, message);
+            last_percent = Some(percent);
+        }
+    }
+    let status = child
+        .wait()
+        .map_err(|error| format!("{context}: {error}"))?;
+    let stdout = stdout_reader.join().unwrap_or_default();
+    let output = Output {
+        status,
+        stdout,
+        stderr: stderr_bytes,
+    };
+    if output.status.success() {
+        if last_percent != Some(completion_percent) {
+            progress.emit(completion_percent, message);
+        }
+        Ok(output)
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let details = if stderr.trim().is_empty() {
+            format!("процесс завершился с кодом {}", output.status)
+        } else {
+            stderr.trim().to_owned()
+        };
+        Err(format!("{context}: {details}"))
+    }
+}
+
+fn parse_whisper_progress(line: &str) -> Option<u8> {
+    let marker = "progress =";
+    let value = line.split_once(marker)?.1.trim();
+    value
+        .trim_end_matches('%')
+        .trim()
+        .parse::<u8>()
+        .ok()
+        .map(|percent| percent.min(100))
+}
+
+fn parse_ffmpeg_progress(line: &str, duration_seconds: f64) -> Option<u8> {
+    if line.trim() == "progress=end" {
+        return Some(100);
+    }
+    let value = line.trim().strip_prefix("out_time_us=")?;
+    let elapsed_microseconds = value.parse::<f64>().ok()?;
+    if duration_seconds <= 0.0 {
+        return None;
+    }
+    Some(
+        (elapsed_microseconds / (duration_seconds * 1_000_000.0) * 100.0)
+            .round()
+            .clamp(0.0, 99.0) as u8,
+    )
+}
+
+fn scale_progress(percent: u8, start_percent: u8, end_percent: u8) -> u8 {
+    let start = start_percent.min(100);
+    let end = end_percent.clamp(start, 100);
+    start + ((u16::from(percent.min(100)) * u16::from(end - start)) / 100) as u8
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LoudnessMeasurement {
+    integrated_lufs: f32,
+    true_peak_dbfs: f32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LoudnessMixPlan {
+    voice_gain_db: f32,
+    normalized_voice_lufs: f32,
+    bed_reduction_db: f32,
+    sidechain_threshold: f32,
+}
+
+struct LoudnessJob<'a> {
+    input: &'a Path,
+    stream_index: Option<usize>,
+    duration_seconds: f64,
+    message: &'static str,
+    start_percent: u8,
+    end_percent: u8,
+}
+
+fn measure_loudness(
+    progress: &StageProgress,
+    ffmpeg: &Path,
+    job: &LoudnessJob<'_>,
+) -> Result<LoudnessMeasurement, String> {
+    let mut command = Command::new(ffmpeg);
+    command
+        .args(["-hide_banner", "-progress", "pipe:2", "-nostats", "-i"])
+        .arg(job.input);
+    if let Some(stream_index) = job.stream_index {
+        command.args(["-map", &format!("0:{stream_index}")]);
+    }
+    let output = run_ffmpeg_with_progress(
+        command.args([
+            "-filter:a",
+            "ebur128=peak=true:framelog=verbose",
+            "-f",
+            "null",
+            "NUL",
+        ]),
+        "Не удалось измерить громкость",
+        progress,
+        job.duration_seconds,
+        job.message,
+        job.start_percent,
+        job.end_percent,
+    )?;
+    parse_loudness_measurement(&String::from_utf8_lossy(&output.stderr))
+}
+
+fn parse_loudness_measurement(output: &str) -> Result<LoudnessMeasurement, String> {
+    let mut integrated_lufs = None;
+    let mut true_peak_dbfs = None;
+    for line in output.lines().map(str::trim) {
+        if let Some(value) = line
+            .strip_prefix("I:")
+            .and_then(|value| value.strip_suffix("LUFS"))
+            .and_then(|value| value.trim().parse::<f32>().ok())
+        {
+            integrated_lufs = Some(value);
+        }
+        if let Some(value) = line
+            .strip_prefix("Peak:")
+            .and_then(|value| value.strip_suffix("dBFS"))
+            .and_then(|value| value.trim().parse::<f32>().ok())
+        {
+            true_peak_dbfs = Some(value);
+        }
+    }
+    Ok(LoudnessMeasurement {
+        integrated_lufs: integrated_lufs.ok_or("FFmpeg не вернул интегральную громкость LUFS")?,
+        true_peak_dbfs: true_peak_dbfs.ok_or("FFmpeg не вернул True Peak")?,
+    })
+}
+
+fn plan_loudness_mix(
+    original_lufs: f32,
+    voice_lufs: f32,
+    target_voice_lufs: f32,
+    desired_gap_db: f32,
+) -> LoudnessMixPlan {
+    let voice_gain_db = (target_voice_lufs - voice_lufs).clamp(-20.0, 20.0);
+    let normalized_voice_lufs = voice_lufs + voice_gain_db;
+    let target_bed_lufs = normalized_voice_lufs - desired_gap_db.clamp(6.0, 24.0);
+    let bed_reduction_db = (original_lufs - target_bed_lufs).clamp(0.0, 30.0);
+    let compression_factor = 1.0 - 1.0 / DUCKING_RATIO;
+    let threshold_db = normalized_voice_lufs - bed_reduction_db / compression_factor.max(0.01);
+    let sidechain_threshold = if bed_reduction_db <= f32::EPSILON {
+        1.0
+    } else {
+        10_f32.powf(threshold_db / 20.0).clamp(0.000_975, 1.0)
+    };
+    LoudnessMixPlan {
+        voice_gain_db,
+        normalized_voice_lufs,
+        bed_reduction_db,
+        sidechain_threshold,
     }
 }
 
@@ -845,22 +1254,9 @@ fn is_russian(language: Option<&str>) -> bool {
     )
 }
 
-fn emit(progress: &ProgressReporter, percent: u8, stage: &'static str, message: &str) {
-    progress.emit(JobProgress {
-        percent,
-        stage,
-        message: message.to_owned(),
-    });
-}
-
-fn emit_tts_progress(progress: &ProgressReporter, complete: usize, total: usize) {
-    let percent = 42 + ((complete * 34) / total.max(1)) as u8;
-    emit(
-        progress,
-        percent,
-        "tts",
-        &format!("Озвучено {complete} из {total} реплик"),
-    );
+fn emit_tts_progress(progress: &StageProgress, complete: usize, total: usize) {
+    let percent = ((complete * 100) / total.max(1)) as u8;
+    progress.emit(percent, &format!("Озвучено {complete} из {total} реплик"));
 }
 
 #[cfg(test)]
@@ -942,5 +1338,71 @@ mod tests {
         assert_eq!(result.segments.len(), 1);
         assert_eq!(result.segments[0].id, "1");
         assert_eq!(result.skipped_count, 1);
+    }
+
+    #[test]
+    fn whisper_progress_is_parsed_from_streamed_stderr() {
+        assert_eq!(
+            parse_whisper_progress("whisper_print_progress_callback: progress =  37%"),
+            Some(37)
+        );
+        assert_eq!(
+            parse_whisper_progress("whisper_print_progress_callback: progress = 100%"),
+            Some(100)
+        );
+        assert_eq!(
+            parse_whisper_progress("whisper_model_load: loading model"),
+            None
+        );
+    }
+
+    #[test]
+    fn loudness_summary_returns_integrated_lufs_and_true_peak() {
+        let output = r#"
+            Integrated loudness:
+              I:         -18.6 LUFS
+              Threshold: -28.9 LUFS
+            True peak:
+              Peak:       -0.7 dBFS
+        "#;
+
+        let measurement = parse_loudness_measurement(output).unwrap();
+
+        assert!((measurement.integrated_lufs + 18.6).abs() < 0.01);
+        assert!((measurement.true_peak_dbfs + 0.7).abs() < 0.01);
+    }
+
+    #[test]
+    fn auto_balance_targets_voice_and_ducks_original_by_requested_gap() {
+        let plan = plan_loudness_mix(-16.0, -20.0, -16.0, 14.0);
+
+        assert!((plan.voice_gain_db - 4.0).abs() < 0.01);
+        assert!((plan.normalized_voice_lufs + 16.0).abs() < 0.01);
+        assert!((plan.bed_reduction_db - 14.0).abs() < 0.01);
+        assert!(plan.sidechain_threshold > 0.0);
+        assert!(plan.sidechain_threshold < 1.0);
+    }
+
+    #[test]
+    fn stage_progress_serializes_stage_position() {
+        let progress = JobProgress {
+            percent: 37,
+            stage: "asr",
+            stage_index: 2,
+            stage_count: 7,
+            message: "Распознавание речи".to_owned(),
+        };
+        let json = serde_json::to_value(progress).unwrap();
+
+        assert_eq!(json["percent"], 37);
+        assert_eq!(json["stageIndex"], 2);
+        assert_eq!(json["stageCount"], 7);
+    }
+
+    #[test]
+    fn subprocess_progress_stays_inside_its_stage_range() {
+        assert_eq!(scale_progress(0, 35, 80), 35);
+        assert_eq!(scale_progress(50, 35, 80), 57);
+        assert_eq!(scale_progress(100, 35, 80), 80);
     }
 }

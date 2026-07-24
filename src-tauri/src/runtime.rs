@@ -49,8 +49,10 @@ pub fn ensure_for_job(
     app.emit(
         "job-progress",
         JobProgress {
-            percent: 1,
+            percent: 0,
             stage: "runtime",
+            stage_index: 1,
+            stage_count: 1,
             message: "Установка недостающих компонентов…".to_owned(),
         },
     )
@@ -99,8 +101,10 @@ pub fn ensure_for_job(
             app.emit(
                 "job-progress",
                 JobProgress {
-                    percent: 1 + percent / 10,
+                    percent,
                     stage: "runtime",
+                    stage_index: 1,
+                    stage_count: 1,
                     message,
                 },
             )

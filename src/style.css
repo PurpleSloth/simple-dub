@@ -288,8 +288,53 @@ h2 {
   padding: 22px;
 }
 
-.tts-card .section-title {
+.tts-card .section-title,
+.balance-card .section-title {
   margin-bottom: 14px;
+}
+
+.balance-card {
+  margin-top: 18px;
+  padding: 22px;
+}
+
+.balance-control {
+  display: grid;
+  grid-template-columns: minmax(220px, 1fr) auto;
+  gap: 12px 20px;
+  align-items: center;
+  padding: 14px;
+  border: 1px solid #2a2e39;
+  border-radius: 13px;
+  background: #191c23;
+}
+
+.balance-control span {
+  display: grid;
+  gap: 4px;
+}
+
+.balance-control strong {
+  font-size: 13px;
+}
+
+.balance-control small {
+  color: #979eae;
+  font-size: 11px;
+}
+
+.balance-control output {
+  min-width: 54px;
+  color: #b2aaff;
+  font-size: 13px;
+  font-weight: 800;
+  text-align: right;
+}
+
+.balance-control input {
+  width: 100%;
+  grid-column: 1 / -1;
+  accent-color: #7666f5;
 }
 
 .tts-choices {

@@ -41,7 +41,7 @@ fn main() -> Result<(), String> {
             .parse()
             .map_err(|error| format!("Неверный DURATION_SECONDS: {error}"))?,
         tts_engine: engine,
-        original_volume: 0.3,
+        ducking_gap_db: 14.0,
     };
     let result = run_dub_job(
         &ProgressReporter::silent(),

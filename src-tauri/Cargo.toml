@@ -1,6 +1,6 @@
 [package]
 name = "simple-dub-desktop"
-version = "0.1.1"
+version = "0.1.2"
 description = "Минимальный одноголосый дубляж видео"
 authors = ["PurpleSloth"]
 edition = "2024"

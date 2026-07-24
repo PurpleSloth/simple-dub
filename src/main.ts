@@ -44,6 +44,8 @@ interface TtsEngineStatus {
 interface JobProgress {
   percent: number;
   stage: string;
+  stageIndex: number;
+  stageCount: number;
   message: string;
 }
 
@@ -51,9 +53,15 @@ interface DubJobResult {
   outputPath: string;
   segmentCount: number;
   skippedSegmentCount: number;
+  voiceLufs: number;
+  originalLufs: number;
+  mixLufs: number;
+  mixTruePeakDbfs: number;
+  duckingDb: number;
 }
 
 const TTS_ENGINE_STORAGE_KEY = "simple-dub.tts-engine";
+const DUCKING_GAP_STORAGE_KEY = "simple-dub.ducking-gap-db";
 
 const state: {
   path: string | null;
@@ -61,6 +69,7 @@ const state: {
   audioIndex: number | null;
   subtitleIndex: number | null;
   ttsEngine: TtsEngineId;
+  duckingGapDb: number;
   ttsStatuses: TtsEngineStatus[];
 } = {
   path: null,
@@ -68,6 +77,7 @@ const state: {
   audioIndex: null,
   subtitleIndex: null,
   ttsEngine: loadStoredTtsEngine(),
+  duckingGapDb: loadStoredDuckingGap(),
   ttsStatuses: [],
 };
 
@@ -175,6 +185,27 @@ app.innerHTML = `
       <div id="tts-list" class="choices tts-choices"></div>
     </section>
 
+    <section id="balance-panel" class="card balance-card is-hidden">
+      <div class="section-title">
+        <span class="step">5</span>
+        <div>
+          <h2>Баланс оригинала и дубляжа</h2>
+          <p>
+            Голос нормализуется до −16 LUFS, а оригинал автоматически
+            приглушается только во время речи.
+          </p>
+        </div>
+      </div>
+      <label class="balance-control" for="ducking-gap">
+        <span>
+          <strong>Разница под голосом</strong>
+          <small>Больше значение — тише оригинал во время дубляжа.</small>
+        </span>
+        <output id="ducking-gap-value">14 dB</output>
+        <input id="ducking-gap" type="range" min="6" max="24" step="1" value="14">
+      </label>
+    </section>
+
     <section id="summary" class="card summary is-hidden">
       <div class="summary-copy">
         <span class="status-dot"></span>
@@ -219,6 +250,11 @@ const audioList = document.querySelector<HTMLElement>("#audio-list");
 const subtitleList = document.querySelector<HTMLElement>("#subtitle-list");
 const ttsPanel = document.querySelector<HTMLElement>("#tts-panel");
 const ttsList = document.querySelector<HTMLElement>("#tts-list");
+const balancePanel = document.querySelector<HTMLElement>("#balance-panel");
+const duckingGapInput =
+  document.querySelector<HTMLInputElement>("#ducking-gap");
+const duckingGapValue =
+  document.querySelector<HTMLOutputElement>("#ducking-gap-value");
 const summary = document.querySelector<HTMLElement>("#summary");
 const routeTitle = document.querySelector<HTMLElement>("#route-title");
 const routeDescription =
@@ -239,6 +275,12 @@ openRouterSettingsForm?.addEventListener("submit", (event) => {
 });
 deleteOpenRouterKeyButton?.addEventListener("click", deleteOpenRouterKey);
 prepareButton?.addEventListener("click", () => void startDubJob());
+duckingGapInput?.addEventListener("input", updateDuckingGap);
+
+if (duckingGapInput) {
+  duckingGapInput.value = String(state.duckingGapDb);
+}
+renderDuckingGap();
 
 void refreshOpenRouterKeyStatus();
 void refreshTtsEngineStatuses();
@@ -346,6 +388,8 @@ async function startDubJob(): Promise<void> {
   renderJobProgress({
     percent: 0,
     stage: "prepare",
+    stageIndex: 0,
+    stageCount: 0,
     message: "Запуск задания…",
   });
 
@@ -362,7 +406,7 @@ async function startDubJob(): Promise<void> {
         ).length,
         durationSeconds: state.media.duration_seconds ?? 0,
         ttsEngine: state.ttsEngine,
-        originalVolume: 0.3,
+        duckingGapDb: state.duckingGapDb,
       },
     });
     if (routeTitle && routeDescription) {
@@ -372,7 +416,10 @@ async function startDubJob(): Promise<void> {
           ? ` · пропущено ${result.skippedSegmentCount}`
           : "";
       routeDescription.textContent =
-        `${result.segmentCount} реплик${skipped} · ${result.outputPath}`;
+        `${result.segmentCount} реплик${skipped} · оригинал ${result.originalLufs.toFixed(1)} LUFS · ` +
+        `голос ${result.voiceLufs.toFixed(1)} LUFS · ` +
+        `приглушение ${result.duckingDb.toFixed(1)} dB · микс ${result.mixLufs.toFixed(1)} LUFS · ` +
+        `пик ${result.mixTruePeakDbfs.toFixed(1)} dBFS · ${result.outputPath}`;
     }
   } catch (error) {
     showError(String(error));
@@ -391,7 +438,26 @@ function renderJobProgress(progress: JobProgress): void {
     progressFill.style.width = `${percent}%`;
   }
   if (progressMessage) {
-    progressMessage.textContent = `${percent}% · ${progress.message}`;
+    const stage =
+      progress.stageIndex > 0 && progress.stageCount > 0
+        ? `Этап ${progress.stageIndex} из ${progress.stageCount} · `
+        : "";
+    progressMessage.textContent =
+      `${stage}${percent}% · ${progress.message}`;
+  }
+}
+
+function updateDuckingGap(): void {
+  const value = Number(duckingGapInput?.value ?? 14);
+  state.duckingGapDb = Math.max(6, Math.min(24, value));
+  localStorage.setItem(DUCKING_GAP_STORAGE_KEY, String(state.duckingGapDb));
+  renderDuckingGap();
+}
+
+function renderDuckingGap(): void {
+  if (duckingGapValue) {
+    duckingGapValue.value = `${state.duckingGapDb} dB`;
+    duckingGapValue.textContent = `${state.duckingGapDb} dB`;
   }
 }
 
@@ -492,6 +558,7 @@ function renderMedia(): void {
   renderTtsChoices();
   trackPanel?.classList.remove("is-hidden");
   ttsPanel?.classList.remove("is-hidden");
+  balancePanel?.classList.remove("is-hidden");
   summary?.classList.remove("is-hidden");
   updateRoute();
 }
@@ -689,6 +756,11 @@ function loadStoredTtsEngine(): TtsEngineId {
   return stored === "silero-v5-5-eugene"
     ? "silero-v5-5-eugene"
     : "piper-dmitri-fp32";
+}
+
+function loadStoredDuckingGap(): number {
+  const stored = Number(localStorage.getItem(DUCKING_GAP_STORAGE_KEY));
+  return Number.isFinite(stored) && stored >= 6 && stored <= 24 ? stored : 14;
 }
 
 function fallbackTtsStatuses(): TtsEngineStatus[] {

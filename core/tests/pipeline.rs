@@ -145,15 +145,21 @@ fn duration_fit_uses_closed_loop_thresholds() {
 #[test]
 fn mix_keeps_stereo_bed_and_centers_mono_voice() {
     let filter = build_mix_filter(&MixOptions {
-        original_volume: 0.3,
         input_audio_stream_index: 4,
+        voice_gain_db: 4.0,
+        ducking_threshold: 0.025,
+        ducking_ratio: 20.0,
     });
 
     assert!(filter.starts_with("[0:4]"));
     assert!(filter.contains("channel_layouts=stereo"));
     assert!(filter.contains("pan=stereo"));
-    assert!(filter.contains("volume=0.300"));
+    assert!(filter.contains("volume=4.000dB"));
+    assert!(filter.contains("sidechaincompress"));
+    assert!(filter.contains("threshold=0.025000"));
+    assert!(filter.contains("ratio=20.000"));
     assert!(filter.contains("amix=inputs=2"));
+    assert!(filter.contains("alimiter=limit=0.850:level=disabled"));
     assert!(!filter.contains("ac=1"));
 }
 
@@ -164,7 +170,7 @@ fn mux_preserves_source_streams_and_adds_russian_dub() {
         dubbed_audio_path: Path::new("work/dubbed.mka"),
         output_path: Path::new("output.dub.ru.mkv"),
         existing_audio_streams: 2,
-        make_default: false,
+        make_default: true,
     });
 
     assert!(args.windows(2).any(|pair| pair == ["-map", "0"]));
@@ -177,6 +183,18 @@ fn mux_preserves_source_streams_and_adds_russian_dub() {
     assert!(
         args.windows(2)
             .any(|pair| pair == ["-metadata:s:a:2", "title=Русский одноголосый дубляж"])
+    );
+    assert!(
+        args.windows(2)
+            .any(|pair| pair == ["-disposition:a:0", "0"])
+    );
+    assert!(
+        args.windows(2)
+            .any(|pair| pair == ["-disposition:a:1", "0"])
+    );
+    assert!(
+        args.windows(2)
+            .any(|pair| pair == ["-disposition:a:2", "default"])
     );
     assert_eq!(args.last().map(String::as_str), Some("output.dub.ru.mkv"));
 }
